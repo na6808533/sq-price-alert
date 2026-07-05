@@ -1,5 +1,5 @@
 """
-Singapore Airlines PUS-AKL price tracker
+Singapore Airlines PUS-AKL price tracker (SerpApi Google Flights version)
 - Route: PUS -> AKL (2026-12-25), AKL -> PUS (2027-01-05)
 - Pax: 3 adults + 1 child
 - Runs daily via GitHub Actions, emails price via Gmail
@@ -25,64 +25,51 @@ DEPART_DATE = "2026-12-25"
 RETURN_DATE = "2027-01-05"
 ADULTS = 3
 CHILDREN = 1
-CARRIER = "SQ"  # Singapore Airlines
-CURRENCY = "KRW"
+AIRLINE_NAME = "Singapore"  # match "Singapore Airlines"
 
 HISTORY_FILE = "price_history.json"
 
-AMADEUS_BASE = "https://api.amadeus.com"  # production. test env: https://test.api.amadeus.com
 
-
-def get_amadeus_token():
-    resp = requests.post(
-        f"{AMADEUS_BASE}/v1/security/oauth2/token",
-        data={
-            "grant_type": "client_credentials",
-            "client_id": os.environ["AMADEUS_CLIENT_ID"],
-            "client_secret": os.environ["AMADEUS_CLIENT_SECRET"],
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
-
-
-def search_flights(token):
+def search_google_flights():
     params = {
-        "originLocationCode": ORIGIN,
-        "destinationLocationCode": DESTINATION,
-        "departureDate": DEPART_DATE,
-        "returnDate": RETURN_DATE,
+        "engine": "google_flights",
+        "departure_id": ORIGIN,
+        "arrival_id": DESTINATION,
+        "outbound_date": DEPART_DATE,
+        "return_date": RETURN_DATE,
         "adults": ADULTS,
         "children": CHILDREN,
-        "currencyCode": CURRENCY,
-        "includedAirlineCodes": CARRIER,
-        "max": 20,
+        "currency": "KRW",
+        "hl": "ko",
+        "type": "1",  # round trip
+        "api_key": os.environ["SERPAPI_KEY"],
     }
-    resp = requests.get(
-        f"{AMADEUS_BASE}/v2/shopping/flight-offers",
-        headers={"Authorization": f"Bearer {token}"},
-        params=params,
-        timeout=60,
-    )
+    resp = requests.get("https://serpapi.com/search.json", params=params, timeout=60)
     resp.raise_for_status()
-    return resp.json().get("data", [])
+    data = resp.json()
+    options = data.get("best_flights", []) + data.get("other_flights", [])
+    return options
 
 
-def summarize_offer(offer):
-    total = float(offer["price"]["grandTotal"])
-    itineraries = []
-    for itin in offer["itineraries"]:
-        segs = itin["segments"]
-        dep = segs[0]["departure"]
-        arr = segs[-1]["arrival"]
-        stops = len(segs) - 1
-        itineraries.append(
-            f"{dep['iataCode']} {dep['at'][5:16].replace('T', ' ')} -> "
-            f"{arr['iataCode']} {arr['at'][5:16].replace('T', ' ')} "
-            f"(경유 {stops}회, {itin['duration'].replace('PT', '').lower()})"
+def is_singapore_airlines(option):
+    segments = option.get("flights", [])
+    if not segments:
+        return False
+    return all(AIRLINE_NAME.lower() in seg.get("airline", "").lower() for seg in segments)
+
+
+def summarize_option(option):
+    price = option.get("price")
+    lines = []
+    for seg in option.get("flights", []):
+        dep = seg.get("departure_airport", {})
+        arr = seg.get("arrival_airport", {})
+        lines.append(
+            f"{dep.get('id', '?')} {dep.get('time', '')} -> "
+            f"{arr.get('id', '?')} {arr.get('time', '')} "
+            f"({seg.get('airline', '')} {seg.get('flight_number', '')})"
         )
-    return total, itineraries
+    return price, lines
 
 
 def load_history():
@@ -119,49 +106,55 @@ def main():
         print("Tracking period ended (2026-07-31). Skipping.")
         return
 
-    token = get_amadeus_token()
-    offers = search_flights(token)
+    options = search_google_flights()
+    sq_options = [o for o in options if is_singapore_airlines(o) and o.get("price")]
 
-    if not offers:
-        send_email(
-            f"[SQ PUS-AKL] {now:%m/%d} 조회 결과 없음",
-            "오늘은 해당 조건(SQ, 12/25 출발, 1/5 귀국)의 운임이 조회되지 않았습니다.",
-        )
-        return
-
-    # Cheapest offer
-    offers.sort(key=lambda o: float(o["price"]["grandTotal"]))
-    total, itineraries = summarize_offer(offers[0])
+    if not sq_options:
+        # fall back: cheapest overall so the email is still useful
+        priced = [o for o in options if o.get("price")]
+        if not priced:
+            send_email(
+                f"[SQ PUS-AKL] {now:%m/%d} 조회 결과 없음",
+                "오늘은 해당 날짜의 운임이 조회되지 않았습니다.",
+            )
+            return
+        priced.sort(key=lambda o: o["price"])
+        price, lines = summarize_option(priced[0])
+        note = "(싱가포르항공 단독 여정이 없어 전체 최저가 기준)"
+    else:
+        sq_options.sort(key=lambda o: o["price"])
+        price, lines = summarize_option(sq_options[0])
+        note = ""
 
     history = load_history()
     prev = history[-1]["price"] if history else None
-    history.append({"date": now.strftime("%Y-%m-%d"), "price": total})
+    history.append({"date": now.strftime("%Y-%m-%d"), "price": price})
     save_history(history)
 
     if prev:
-        diff = total - prev
+        diff = price - prev
         arrow = "▲" if diff > 0 else ("▼" if diff < 0 else "―")
-        change_line = f"전일 대비: {arrow} {abs(diff):,.0f}원 (어제 {prev:,.0f}원)"
+        change_line = f"전일 대비: {arrow} {abs(diff):,}원 (어제 {prev:,}원)"
     else:
         change_line = "첫 조회입니다."
 
     min_rec = min(history, key=lambda h: h["price"])
 
     body = (
-        f"싱가포르항공 부산-오클랜드 왕복 (성인 3, 아동 1)\n"
+        f"싱가포르항공 부산-오클랜드 왕복 (성인 3, 아동 1) {note}\n"
         f"출발 {DEPART_DATE} / 귀국 {RETURN_DATE}\n\n"
-        f"오늘 최저가: {total:,.0f}원\n"
+        f"오늘 최저가: {price:,}원\n"
         f"{change_line}\n"
-        f"추적 기간 최저: {min_rec['price']:,.0f}원 ({min_rec['date']})\n\n"
-        f"[여정]\n" + "\n".join(itineraries) + "\n\n"
-        f"* Amadeus GDS 기준 가격으로, 싱가포르항공 홈페이지 가격과 다를 수 있습니다.\n"
+        f"추적 기간 최저: {min_rec['price']:,}원 ({min_rec['date']})\n\n"
+        f"[여정]\n" + "\n".join(lines) + "\n\n"
+        f"* Google Flights 기준 가격입니다.\n"
         f"* 조회 시각: {now:%Y-%m-%d %H:%M} KST"
     )
-    subject = f"[SQ PUS-AKL] {now:%m/%d} 최저가 {total:,.0f}원 " + (
-        "▼하락" if prev and total < prev else ("▲상승" if prev and total > prev else "")
+    subject = f"[SQ PUS-AKL] {now:%m/%d} 최저가 {price:,}원 " + (
+        "▼하락" if prev and price < prev else ("▲상승" if prev and price > prev else "")
     )
     send_email(subject.strip(), body)
-    print(f"Sent. Price: {total:,.0f} KRW")
+    print(f"Sent. Price: {price:,} KRW")
 
 
 if __name__ == "__main__":
