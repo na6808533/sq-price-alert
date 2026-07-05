@@ -1,9 +1,9 @@
 """
-Singapore Airlines PUS-AKL price tracker (SerpApi Google Flights version)
-- Route: PUS -> AKL (2026-12-25), AKL -> PUS (2027-01-05)
+PUS-AKL price tracker v3 (SerpApi Google Flights)
+- Outbound: 2026-12-24 AND 2026-12-25 / Return: 2027-01-05
 - Pax: 3 adults + 1 child
-- Runs daily via GitHub Actions, emails price via Gmail
-- Auto-stops after 2026-07-31 (KST)
+- Airlines tracked: Singapore Airlines (SQ), China Airlines (CI)
+- Daily email via Gmail; auto-stops after 2026-07-31 (KST)
 """
 
 import os
@@ -21,21 +21,21 @@ END_DATE = datetime(2026, 7, 31, 23, 59, tzinfo=KST)
 
 ORIGIN = "PUS"
 DESTINATION = "AKL"
-DEPART_DATE = "2026-12-25"
+DEPART_DATES = ["2026-12-24", "2026-12-25"]   # 출발일 후보 (원하면 추가/삭제)
 RETURN_DATE = "2027-01-05"
 ADULTS = 3
 CHILDREN = 1
-AIRLINE_NAME = "Singapore"  # match "Singapore Airlines"
+AIRLINES = {"SQ": "싱가포르항공", "CI": "중화항공"}  # 항공편명 코드로 매칭
 
 HISTORY_FILE = "price_history.json"
 
 
-def search_google_flights():
+def search_google_flights(depart_date):
     params = {
         "engine": "google_flights",
         "departure_id": ORIGIN,
         "arrival_id": DESTINATION,
-        "outbound_date": DEPART_DATE,
+        "outbound_date": depart_date,
         "return_date": RETURN_DATE,
         "adults": ADULTS,
         "children": CHILDREN,
@@ -47,29 +47,32 @@ def search_google_flights():
     resp = requests.get("https://serpapi.com/search.json", params=params, timeout=60)
     resp.raise_for_status()
     data = resp.json()
-    options = data.get("best_flights", []) + data.get("other_flights", [])
-    return options
+    return data.get("best_flights", []) + data.get("other_flights", [])
 
 
-def is_singapore_airlines(option):
+def airline_code_of(option):
+    """Return airline code (e.g. 'SQ') if ALL segments share it, else None."""
     segments = option.get("flights", [])
     if not segments:
-        return False
-    return all(AIRLINE_NAME.lower() in seg.get("airline", "").lower() for seg in segments)
+        return None
+    codes = set()
+    for seg in segments:
+        fn = seg.get("flight_number", "").strip()  # e.g. "SQ 607", "CI 187"
+        codes.add(fn.split(" ")[0] if fn else "?")
+    return codes.pop() if len(codes) == 1 else None
 
 
 def summarize_option(option):
-    price = option.get("price")
     lines = []
     for seg in option.get("flights", []):
         dep = seg.get("departure_airport", {})
         arr = seg.get("arrival_airport", {})
         lines.append(
-            f"{dep.get('id', '?')} {dep.get('time', '')} -> "
+            f"  {dep.get('id', '?')} {dep.get('time', '')} -> "
             f"{arr.get('id', '?')} {arr.get('time', '')} "
             f"({seg.get('airline', '')} {seg.get('flight_number', '')})"
         )
-    return price, lines
+    return lines
 
 
 def load_history():
@@ -106,55 +109,78 @@ def main():
         print("Tracking period ended (2026-07-31). Skipping.")
         return
 
-    options = search_google_flights()
-    sq_options = [o for o in options if is_singapore_airlines(o) and o.get("price")]
-
-    if not sq_options:
-        # fall back: cheapest overall so the email is still useful
-        priced = [o for o in options if o.get("price")]
-        if not priced:
-            send_email(
-                f"[SQ PUS-AKL] {now:%m/%d} 조회 결과 없음",
-                "오늘은 해당 날짜의 운임이 조회되지 않았습니다.",
-            )
-            return
-        priced.sort(key=lambda o: o["price"])
-        price, lines = summarize_option(priced[0])
-        note = "(싱가포르항공 단독 여정이 없어 전체 최저가 기준)"
-    else:
-        sq_options.sort(key=lambda o: o["price"])
-        price, lines = summarize_option(sq_options[0])
-        note = ""
+    # today's prices: {"12/24 SQ": {"price": ..., "lines": [...]}, ...}
+    today = {}
+    for dep_date in DEPART_DATES:
+        options = search_google_flights(dep_date)
+        short_date = dep_date[5:].replace("-", "/")  # "12/24"
+        for code, name in AIRLINES.items():
+            matched = [o for o in options if airline_code_of(o) == code and o.get("price")]
+            if matched:
+                matched.sort(key=lambda o: o["price"])
+                best = matched[0]
+                today[f"{short_date} {code}"] = {
+                    "airline": name,
+                    "price": best["price"],
+                    "lines": summarize_option(best),
+                }
 
     history = load_history()
-    prev = history[-1]["price"] if history else None
-    history.append({"date": now.strftime("%Y-%m-%d"), "price": price})
+    prev_entry = history[-1] if history else None
+    prev_prices = prev_entry.get("prices", {}) if prev_entry else {}
+
+    record = {
+        "date": now.strftime("%Y-%m-%d"),
+        "prices": {k: v["price"] for k, v in today.items()},
+    }
+    history.append(record)
     save_history(history)
 
-    if prev:
-        diff = price - prev
-        arrow = "▲" if diff > 0 else ("▼" if diff < 0 else "―")
-        change_line = f"전일 대비: {arrow} {abs(diff):,}원 (어제 {prev:,}원)"
-    else:
-        change_line = "첫 조회입니다."
+    # period minimums per key
+    def period_min(key):
+        vals = [
+            (h["prices"][key], h["date"])
+            for h in history
+            if isinstance(h.get("prices"), dict) and key in h["prices"]
+        ]
+        return min(vals) if vals else None
 
-    min_rec = min(history, key=lambda h: h["price"])
+    if not today:
+        send_email(
+            f"[PUS-AKL] {now:%m/%d} 조회 결과 없음",
+            "오늘은 SQ/CI 단독 여정 운임이 조회되지 않았습니다.",
+        )
+        return
 
+    sections = []
+    for key in sorted(today.keys()):
+        info = today[key]
+        price = info["price"]
+        prev = prev_prices.get(key)
+        if prev:
+            diff = price - prev
+            arrow = "▲" if diff > 0 else ("▼" if diff < 0 else "―")
+            change = f"전일 대비 {arrow} {abs(diff):,}원"
+        else:
+            change = "첫 조회"
+        pm = period_min(key)
+        min_line = f"기간 최저 {pm[0]:,}원 ({pm[1]})" if pm else ""
+        sections.append(
+            f"■ {key} 출발 · {info['airline']}\n"
+            f"  최저가: {price:,}원  ({change}, {min_line})\n"
+            + "\n".join(info["lines"])
+        )
+
+    overall = min(today.items(), key=lambda kv: kv[1]["price"])
     body = (
-        f"싱가포르항공 부산-오클랜드 왕복 (성인 3, 아동 1) {note}\n"
-        f"출발 {DEPART_DATE} / 귀국 {RETURN_DATE}\n\n"
-        f"오늘 최저가: {price:,}원\n"
-        f"{change_line}\n"
-        f"추적 기간 최저: {min_rec['price']:,}원 ({min_rec['date']})\n\n"
-        f"[여정]\n" + "\n".join(lines) + "\n\n"
-        f"* Google Flights 기준 가격입니다.\n"
-        f"* 조회 시각: {now:%Y-%m-%d %H:%M} KST"
+        f"부산-오클랜드 왕복 (성인 3, 아동 1) / 귀국 {RETURN_DATE}\n"
+        f"오늘의 최저 조합: {overall[0]} {overall[1]['airline']} {overall[1]['price']:,}원\n\n"
+        + "\n\n".join(sections)
+        + f"\n\n* Google Flights 기준 가격입니다.\n* 조회 시각: {now:%Y-%m-%d %H:%M} KST"
     )
-    subject = f"[SQ PUS-AKL] {now:%m/%d} 최저가 {price:,}원 " + (
-        "▼하락" if prev and price < prev else ("▲상승" if prev and price > prev else "")
-    )
-    send_email(subject.strip(), body)
-    print(f"Sent. Price: {price:,} KRW")
+    subject = f"[PUS-AKL] {now:%m/%d} 최저 {overall[1]['price']:,}원 ({overall[0]} {overall[1]['airline']})"
+    send_email(subject, body)
+    print(f"Sent. Best: {overall[0]} {overall[1]['price']:,} KRW")
 
 
 if __name__ == "__main__":
